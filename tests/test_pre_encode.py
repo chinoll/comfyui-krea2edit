@@ -231,6 +231,43 @@ def test_target_latent_without_pixel_path_is_inert():
     assert seen[0].shape == (1, 4, 64, 64)
 
 
+def test_grounded_encode_keeps_image_grounded_text_but_removes_visual_positions():
+    """The VLM must run on image positions, but the returned DiT context must not
+    retain those positions (or their matching attention-mask entries)."""
+    mod = _load_pack()
+
+    class _FakeVLM:
+        def __init__(self):
+            self.was_called = False
+
+        def build_image_inputs(self, *_args, **_kwargs):
+            self.was_called = True
+            # Full VLM sequence: two stripped-prefix tokens, then a 4-token DiT
+            # suffix where positions 1 and 3 are visual patches.
+            return None, torch.tensor([[False, True, False, True, False, True]]), None
+
+    class _FakeClip:
+        def __init__(self):
+            self.vlm = _FakeVLM()
+            self.cond_stage_model = type("Stage", (), {
+                "transformer": type("ClipModel", (), {"transformer": self.vlm})()
+            })()
+
+        def encode_from_tokens_scheduled(self, _tokens):
+            self.vlm.build_image_inputs(None, [])
+            cond = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
+            return [[cond, {"attention_mask": torch.tensor([[1, 1, 0, 1]])}]]
+
+    clip = _FakeClip()
+    result = mod._encode_grounded_text_only(clip, object())
+
+    cond, options = result[0]
+    assert clip.vlm.was_called, "the image must still be encoded by Qwen3-VL"
+    assert cond.tolist() == [[[0.0, 1.0], [4.0, 5.0]]]
+    assert options["attention_mask"].tolist() == [[1, 0]]
+    assert "build_image_inputs" not in clip.vlm.__dict__, "temporary capture hook must be removed"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

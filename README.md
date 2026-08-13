@@ -3,7 +3,8 @@
 Instruction-based image editing for **Krea 2** in ComfyUI — the node pack that powers
 the **Krea 2 Identity Edit** LoRA. Turns Krea 2 (Raw or Turbo) into an image editor with dual
 conditioning: the source image is injected both as VAE latent tokens (appearance) and
-into the Qwen3-VL text encoder (semantic grounding), matching how the LoRA was trained.
+into the Qwen3-VL text encoder (semantic grounding). The VLM's visual-patch hidden
+states are then removed, so only image-grounded language-token states enter the DiT.
 
 ☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU compute for future versions.
 
@@ -50,7 +51,9 @@ in-context tokens (RoPE frame 1). Inputs:
 
 ### `Krea2EditGroundedEncode`
 Image-grounded instruction encoding — the text encoder *sees* the image while
-reading your instruction, exactly as during training. Inputs:
+reading your instruction. Its visual-patch hidden states are removed before the
+conditioning reaches the DiT, while the remaining language-token states retain the
+VLM's image grounding. Inputs:
 - `clip` — the Krea 2 CLIP (Qwen3-VL, loaded with `type: krea2`)
 - `prompt` — the edit instruction ("recolor the car to matte black")
 - `image` — the same source image

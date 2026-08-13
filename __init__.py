@@ -14,6 +14,7 @@ Wiring:  LoadImage -> VAEEncode(source) --\
 KSampler.latent_image <- EmptySD3LatentImage (noise). Text: NATIVE krea2 CLIP + CLIPTextEncode.
 """
 import math
+import threading
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +26,106 @@ import comfy.ldm.common_dit
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.flux.math import apply_rope
 from comfy.ldm.modules.attention import optimized_attention_masked
+
+
+# ``Krea2TEModel`` lives in ComfyUI, outside this node pack. During an image-grounded
+# encode it expands each ``<|image_pad|>`` placeholder into a variable-length visual
+# span, so the span cannot be reconstructed reliably from the prompt string alone.
+# The lock scopes the small, temporary hook used to capture that authoritative mask.
+_VLM_MASK_CAPTURE_LOCK = threading.RLock()
+
+
+def _remove_visual_tokens_from_conditioning(conditioning, visual_masks):
+    """Drop image-patch positions from ComfyUI Krea2 conditioning.
+
+    Qwen3-VL has already processed the image when this runs: the retained language
+    token states can therefore carry image-grounded semantics. Only positions marked
+    by Qwen3-VL itself as visual patches are removed before the conditioning enters
+    the DiT. The companion attention mask must be filtered identically.
+    """
+    if len(conditioning) != len(visual_masks):
+        raise RuntimeError(
+            "krea2edit: captured VLM visual-mask count does not match the number of "
+            "ComfyUI conditioning segments; refusing to pass unfiltered visual tokens to the DiT."
+        )
+
+    filtered = []
+    for (cond, options), visual_mask in zip(conditioning, visual_masks):
+        if visual_mask is None:
+            raise RuntimeError(
+                "krea2edit: Qwen3-VL did not report visual positions for an image-grounded "
+                "encode; refusing to pass unfiltered visual tokens to the DiT."
+            )
+        if cond.ndim != 3 or visual_mask.ndim != 2:
+            raise RuntimeError(
+                "krea2edit: unexpected conditioning or visual-mask rank while filtering VLM tokens."
+            )
+
+        # ComfyUI's Krea2 encoder removes its system/user prefix before returning
+        # ``cond``. Align the full Qwen3-VL mask to that returned suffix.
+        offset = visual_mask.shape[1] - cond.shape[1]
+        if offset < 0:
+            raise RuntimeError(
+                "krea2edit: Qwen3-VL visual mask is shorter than the returned conditioning."
+            )
+        visual_mask = visual_mask[:, offset:]
+        if visual_mask.shape != cond.shape[:2]:
+            raise RuntimeError(
+                "krea2edit: visual mask does not align with the returned Krea2 conditioning."
+            )
+        # A Comfy conditioning tensor has one shared sequence layout. Per-batch masks
+        # that differ would require ragged conditioning, which DiT cannot represent.
+        if not bool((visual_mask == visual_mask[:1]).all()):
+            raise RuntimeError(
+                "krea2edit: batch items have different visual-token layouts; cannot build "
+                "a single text-only DiT conditioning tensor."
+            )
+
+        keep = ~visual_mask[0]
+        next_options = dict(options)
+        attention_mask = next_options.get("attention_mask")
+        if attention_mask is not None:
+            if attention_mask.shape != cond.shape[:2]:
+                raise RuntimeError(
+                    "krea2edit: attention mask does not align with Krea2 conditioning."
+                )
+            next_options["attention_mask"] = attention_mask[:, keep]
+        filtered.append([cond[:, keep, :], next_options])
+    return filtered
+
+
+def _encode_grounded_text_only(clip, tokens):
+    """Encode through Qwen3-VL, then remove its visual states from DiT context.
+
+    The hook is around the *real* ComfyUI encode call (not a second preprocessing
+    pass), so it captures the exact dynamic visual span produced by the VLM.
+    """
+    try:
+        vlm = clip.cond_stage_model.transformer.transformer
+        original_build_image_inputs = vlm.build_image_inputs
+    except AttributeError as exc:
+        raise RuntimeError(
+            "krea2edit: this node requires ComfyUI's native Qwen3-VL/Krea2 text encoder "
+            "with build_image_inputs support."
+        ) from exc
+
+    visual_masks = []
+
+    def capture_visual_mask(*args, **kwargs):
+        result = original_build_image_inputs(*args, **kwargs)
+        visual_masks.append(result[1])
+        return result
+
+    with _VLM_MASK_CAPTURE_LOCK:
+        # ``build_image_inputs`` is normally resolved from Qwen3VL's class. Restore
+        # that descriptor in ``finally`` even when ComfyUI's encode raises.
+        vlm.build_image_inputs = capture_visual_mask
+        try:
+            conditioning = clip.encode_from_tokens_scheduled(tokens)
+        finally:
+            del vlm.build_image_inputs
+
+    return _remove_visual_tokens_from_conditioning(conditioning, visual_masks)
 
 
 def _imgids(bs, frame, h_, w_, device):
@@ -383,8 +484,10 @@ class Krea2EditModelPatch:
 class Krea2EditGroundedEncode:
     """Image-grounded instruction encode — the SEMANTIC path of krea2_edit.
 
-    Training always encodes the instruction TOGETHER with the source image through
-    Qwen3-VL (user turn = <vision tokens: source> + instruction) and taps 12 layers.
+    The VLM encodes the instruction TOGETHER with the source image (user turn =
+    <vision tokens: source> + instruction) and taps 12 layers. Its visual-patch
+    hidden states are removed before DiT conditioning, leaving only image-grounded
+    language-token states in the DiT text stream.
     Stock CLIPTextEncode is text-only, so inference was running with the grounding
     half of the recipe missing (the VAE source tokens carry appearance; THIS carries
     scene semantics: "the man on the left", "the sign in the back").
@@ -434,7 +537,7 @@ class Krea2EditGroundedEncode:
     RETURN_TYPES = ("CONDITIONING",)
     FUNCTION = "encode"
     CATEGORY = "krea2edit"
-    DESCRIPTION = "Encodes the edit instruction grounded on the source image (training-matched semantic path)."
+    DESCRIPTION = "Encodes an instruction with Qwen3-VL image grounding, then sends only its language-token states to the DiT."
 
     KREA2_EDIT_TEMPLATE_2REF = (
         "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
@@ -465,7 +568,7 @@ class Krea2EditGroundedEncode:
             imgs.append(self._prep(image_b, grounding_px))
         template = self._template(len(imgs), system_prompt)
         tokens = clip.tokenize(prompt, images=imgs, llama_template=template)
-        return (clip.encode_from_tokens_scheduled(tokens),)
+        return (_encode_grounded_text_only(clip, tokens),)
 
 
 NODE_CLASS_MAPPINGS = {
