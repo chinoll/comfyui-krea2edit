@@ -109,6 +109,10 @@ class _FakeVAE:
         b, h, w, _ = pixels.shape
         return torch.zeros(b, 4, h // 8, w // 8)
 
+    def decode(self, samples):       # samples: (B, C, H, W)
+        b, _c, h, w = samples.shape
+        return torch.zeros(b, h * 8, w * 8, 3)
+
 
 class _FakeInner:
     def process_latent_in(self, x):
@@ -273,6 +277,22 @@ def test_target_latent_without_pixel_path_is_inert():
     wrapper = _patch(mod, target_latent=_latent())
     _run_steps(wrapper)
     assert seen[0].shape == (1, 4, 64, 64)
+
+
+def test_arbitrary_size_canvas_round_trips_exact_pixel_size():
+    """The sampling canvas may be any HxW; only its VAE alignment pad is removed."""
+    mod = _load_pack()
+    vae = _FakeVAE()
+
+    latent, width, height = mod.Krea2EditEmptyLatent().make(vae, 513, 777)
+
+    # The VAE works on the /8 ceiling grid.  The requested geometry is preserved
+    # separately so decode can remove only the bottom/right alignment pixels.
+    assert vae.calls == [(1, 784, 520, 3)]
+    assert latent["samples"].shape == (1, 4, 98, 65)
+
+    (image,) = mod.Krea2EditVAEDecode().decode(vae, latent, width, height)
+    assert image.shape == (1, 777, 513, 3)
 
 
 def test_grounded_encode_keeps_image_grounded_text_but_removes_visual_positions():

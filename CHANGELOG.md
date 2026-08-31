@@ -4,6 +4,14 @@ Weights: https://huggingface.co/conradlocke/krea2-identity-edit
 v1.2 updates the **nodes** (see below); they stay backward-compatible with v1/v1.1
 weights via `fit_mode: crop`.
 
+## Unreleased
+
+### Added
+- **Exact arbitrary-size output:** `Krea2EditEmptyLatent` makes a VAE-aligned
+  sampling canvas for any positive requested pixel width/height, and
+  `Krea2EditVAEDecode` removes only the bottom/right alignment pad after decoding.
+  The bundled workflow now uses this pair, including its exact-dimension wiring.
+
 ## v1.2.5 — 2026-07-29
 
 ### Added

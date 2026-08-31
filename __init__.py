@@ -11,7 +11,8 @@ non-causal and the RoPE IDs are unchanged. Only target tokens are returned.
 Wiring:  LoadImage -> VAEEncode(source) --\
                                             Krea2EditModelPatch(model, source_latent) -> KSampler
          UNETLoader -> LoraLoaderModelOnly -/
-KSampler.latent_image <- EmptySD3LatentImage (noise). Text: NATIVE krea2 CLIP + CLIPTextEncode.
+KSampler.latent_image <- Krea2EditEmptyLatent for exact arbitrary pixel dimensions
+(or EmptySD3LatentImage for /8-aligned dimensions). Text: NATIVE Krea2 Qwen3-VL CLIP.
 """
 import math
 import threading
@@ -520,13 +521,76 @@ class Krea2EditGroundedEncode:
         return (_encode_grounded_text_only(clip, tokens),)
 
 
+class Krea2EditEmptyLatent:
+    """Make a Krea-compatible sampling canvas at an exact pixel size.
+
+    The VAE receives a bottom/right padded canvas so its /8 latent grid can represent
+    any requested pixel dimensions. ``Krea2EditVAEDecode`` crops the decoded result
+    back to the requested size after sampling.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "vae": ("VAE",),
+            "width": ("INT", {"default": 1024, "min": 1, "max": 65536, "step": 1}),
+            "height": ("INT", {"default": 1024, "min": 1, "max": 65536, "step": 1}),
+            "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+        }}
+
+    RETURN_TYPES = ("LATENT", "INT", "INT")
+    RETURN_NAMES = ("latent", "width", "height")
+    FUNCTION = "make"
+    CATEGORY = "krea2edit"
+    DESCRIPTION = "Creates a sampling latent for any pixel width/height without resizing the requested output."
+
+    def make(self, vae, width, height, batch_size=1):
+        pad_h, pad_w = (-height) % 8, (-width) % 8
+        pixels = torch.zeros(
+            batch_size, height + pad_h, width + pad_w, 3, dtype=torch.float32
+        )
+        # Ask the selected VAE for its actual latent layout instead of assuming a
+        # particular channel count.  Sampling must start from noise/zero latent, not
+        # the encoding of a black image, so discard the probe values afterwards.
+        return ({"samples": torch.zeros_like(vae.encode(pixels))}, width, height)
+
+
+class Krea2EditVAEDecode:
+    """VAE-decode an arbitrary-size canvas and remove its alignment-only padding."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "vae": ("VAE",),
+            "latent": ("LATENT",),
+            "width": ("INT", {"default": 1024, "min": 1, "max": 65536, "step": 1}),
+            "height": ("INT", {"default": 1024, "min": 1, "max": 65536, "step": 1}),
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "decode"
+    CATEGORY = "krea2edit"
+    DESCRIPTION = "Decodes a Krea2Edit arbitrary-size latent and crops only alignment padding."
+
+    def decode(self, vae, latent, width, height):
+        pixels = vae.decode(latent["samples"])
+        if pixels.shape[1] < height or pixels.shape[2] < width:
+            raise ValueError(
+                "krea2edit: decoded image is smaller than the requested output size; "
+                "use the width/height emitted by Krea2EditEmptyLatent."
+            )
+        return (pixels[:, :height, :width, :],)
+
+
 NODE_CLASS_MAPPINGS = {
     "Krea2EditModelPatch": Krea2EditModelPatch,
     "Krea2EditGroundedEncode": Krea2EditGroundedEncode,
+    "Krea2EditEmptyLatent": Krea2EditEmptyLatent,
+    "Krea2EditVAEDecode": Krea2EditVAEDecode,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2EditModelPatch": "Krea2 Edit (source patch)",
     "Krea2EditGroundedEncode": "Krea2 Edit (grounded encode)",
+    "Krea2EditEmptyLatent": "Krea2 Edit (arbitrary-size latent)",
+    "Krea2EditVAEDecode": "Krea2 Edit (arbitrary-size VAE decode)",
 }
 
 

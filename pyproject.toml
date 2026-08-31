@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-krea2edit"
-description = "Krea 2 Identity Edit — in-context instruction-edit nodes for the Krea 2 model: source-image appearance preservation (VAE reference tokens + 3D-RoPE), image-grounded instruction encoding, a reference-fidelity dial (ref_boost), and the training-matched FIT reference geometry."
+description = "Krea 2 Identity Edit — in-context instruction-edit nodes for Krea 2: native-grid source preservation, image-grounded text conditioning, and arbitrary-size output canvases."
 version = "1.2.5"
 license = { file = "LICENSE" }
 readme = "README.md"
@@ -8,7 +8,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/lbouaraba/comfyui-krea2edit"
+Repository = "https://github.com/chinoll/comfyui-krea2edit"
 
 [tool.comfy]
 PublisherId = "conradlocke"

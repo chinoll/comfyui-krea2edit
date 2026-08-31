@@ -2,7 +2,7 @@
   "id": "krea2-identity-edit-unified",
   "revision": 0,
   "last_node_id": 110,
-  "last_link_id": 27,
+  "last_link_id": 31,
   "nodes": [
     {
       "id": 29,
@@ -103,7 +103,7 @@
     },
     {
       "id": 54,
-      "type": "VAEDecode",
+      "type": "Krea2EditVAEDecode",
       "pos": [
         2810,
         440
@@ -119,14 +119,24 @@
       "mode": 0,
       "inputs": [
         {
-          "name": "samples",
+          "name": "vae",
+          "type": "VAE",
+          "link": 29
+        },
+        {
+          "name": "latent",
           "type": "LATENT",
           "link": 25
         },
         {
-          "name": "vae",
-          "type": "VAE",
-          "link": 6
+          "name": "width",
+          "type": "INT",
+          "link": 30
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "link": 31
         }
       ],
       "outputs": [
@@ -139,11 +149,12 @@
         }
       ],
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.26.0",
-        "Node name for S&R": "VAEDecode"
+        "Node name for S&R": "Krea2EditVAEDecode"
       },
-      "widgets_values": []
+      "widgets_values": [
+        1024,
+        1024
+      ]
     },
     {
       "id": 55,
@@ -249,10 +260,11 @@
           "name": "VAE",
           "type": "VAE",
           "links": [
-            6,
             7,
             8,
-            16
+            16,
+            28,
+            29
           ]
         }
       ],
@@ -479,7 +491,7 @@
     },
     {
       "id": 82,
-      "type": "EmptySD3LatentImage",
+      "type": "Krea2EditEmptyLatent",
       "pos": [
         1260,
         410
@@ -492,6 +504,11 @@
       "order": 16,
       "mode": 0,
       "inputs": [
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 28
+        },
         {
           "name": "width",
           "type": "INT",
@@ -511,18 +528,30 @@
       ],
       "outputs": [
         {
-          "name": "LATENT",
+          "name": "latent",
           "type": "LATENT",
           "links": [
             24,
             27
           ]
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": [
+            30
+          ]
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": [
+            31
+          ]
         }
       ],
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.26.0",
-        "Node name for S&R": "EmptySD3LatentImage"
+        "Node name for S&R": "Krea2EditEmptyLatent"
       },
       "widgets_values": [
         1024,
@@ -550,14 +579,16 @@
           "name": "width",
           "type": "INT",
           "links": [
-            9
+            9,
+            30
           ]
         },
         {
           "name": "height",
           "type": "INT",
           "links": [
-            10
+            10,
+            31
           ]
         }
       ],
@@ -1014,14 +1045,6 @@
       "CLIP"
     ],
     [
-      6,
-      57,
-      0,
-      54,
-      1,
-      "VAE"
-    ],
-    [
       7,
       57,
       0,
@@ -1188,6 +1211,38 @@
       79,
       7,
       "LATENT"
+    ],
+    [
+      28,
+      57,
+      0,
+      82,
+      0,
+      "VAE"
+    ],
+    [
+      29,
+      57,
+      0,
+      54,
+      0,
+      "VAE"
+    ],
+    [
+      30,
+      82,
+      1,
+      54,
+      2,
+      "INT"
+    ],
+    [
+      31,
+      82,
+      2,
+      54,
+      3,
+      "INT"
     ]
   ],
   "groups": [
