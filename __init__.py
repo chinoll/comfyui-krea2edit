@@ -11,8 +11,8 @@ non-causal and the RoPE IDs are unchanged. Only target tokens are returned.
 Wiring:  LoadImage -> VAEEncode(source) --\
                                             Krea2EditModelPatch(model, source_latent) -> KSampler
          UNETLoader -> LoraLoaderModelOnly -/
-KSampler.latent_image <- Krea2EditEmptyLatent for exact arbitrary pixel dimensions
-(or EmptySD3LatentImage for /8-aligned dimensions). Text: NATIVE Krea2 Qwen3-VL CLIP.
+KSampler.latent_image <- Krea2EditEmptyLatent for arbitrary requested dimensions,
+rounded to the nearest 16px patch grid. Text: NATIVE Krea2 Qwen3-VL CLIP.
 """
 import math
 import threading
@@ -145,6 +145,37 @@ def _to_4d(v):
     return v
 
 
+def _nearest_patch_size(size, patch=16):
+    """Nearest positive pixel size on Krea's 16px VAE/DiT lattice."""
+    return max(patch, ((size + patch // 2) // patch) * patch)
+
+
+def _resize_to_patch_grid(image, patch=16):
+    """Resize BHWC image independently to the closest DiT patch grid.
+
+    This deliberately permits the tiny aspect-ratio change requested by the workflow:
+    images are never cropped or edge-padded merely to satisfy the VAE/DiT lattice.
+    """
+    pixels = image[..., :3].clamp(0, 1)
+    h, w = pixels.shape[-3:-1]
+    aligned_h, aligned_w = _nearest_patch_size(h, patch), _nearest_patch_size(w, patch)
+    if (aligned_h, aligned_w) == (h, w):
+        return pixels
+    return F.interpolate(
+        pixels.movedim(-1, 1), size=(aligned_h, aligned_w),
+        mode="bilinear", align_corners=False,
+    ).movedim(1, -1)
+
+
+def _resize_latent_to_patch_grid(latent, patch=2):
+    """Resize BCHW latents to the nearest DiT patch grid for direct-LATENT inputs."""
+    h, w = latent.shape[-2:]
+    aligned_h, aligned_w = _nearest_patch_size(h, patch), _nearest_patch_size(w, patch)
+    if (aligned_h, aligned_w) == (h, w):
+        return latent
+    return F.interpolate(latent, size=(aligned_h, aligned_w), mode="bilinear", align_corners=False)
+
+
 def _split_reference_images(images):
     """Normalize an IMAGE batch (or a list of batches) into B=1 reference images."""
     if images is None:
@@ -171,21 +202,17 @@ def _split_reference_latents(latent):
 
 
 def _encode_native_source_image(image, vae, cache, key):
-    """VAE-encode a source on its own grid, without crop or resize.
+    """VAE-encode a source on its own independently aligned grid.
 
-    The VAE is /8 and Krea's DiT patch is 2x2 latent cells, so only bottom/right
-    replicate padding to a 16-pixel lattice is required. It preserves every input
-    pixel and lets the reference start its independent RoPE grid at (h=0, w=0).
+    The VAE is /8 and Krea's DiT patch is 2x2 latent cells. Resize H and W independently
+    to the *nearest* 16-pixel lattice instead of padding or cropping, then let the
+    reference begin its independent RoPE grid at (h=0, w=0).
     """
     if key in cache:
         return cache[key]
-    img = image.movedim(-1, 1)  # B,H,W,C -> B,C,H,W
-    pad_h, pad_w = (-img.shape[-2]) % 16, (-img.shape[-1]) % 16
-    if pad_h or pad_w:
-        img = F.pad(img, (0, pad_w, 0, pad_h), mode="replicate")
-    pixels = img.movedim(1, -1)[..., :3].clamp(0, 1)
-    print(f"[krea2edit] native source VAE encode: {tuple(image.shape[-3:-1])} -> "
-          f"{tuple(pixels.shape[-3:-1])} px (edge padding only)", flush=True)
+    pixels = _resize_to_patch_grid(image)
+    print(f"[krea2edit] patch-aligned source VAE encode: {tuple(image.shape[-3:-1])} -> "
+          f"{tuple(pixels.shape[-3:-1])} px (nearest 16px resize)", flush=True)
     cache[key] = vae.encode(pixels)
     return cache[key]
 
@@ -249,8 +276,8 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     H, W = x.shape[-2], x.shape[-1]
     h_, w_ = H // patch, W // patch
 
-    # Every source keeps its own latent grid.  We only pad its bottom/right edge to
-    # the DiT patch lattice; no target-dependent crop, resize, or coordinate offset.
+    # Pixel-path sources have already been resized to this grid. Keep a defensive
+    # patch alignment here for direct LATENT inputs from older workflows.
     src_list = src_latent if isinstance(src_latent, (list, tuple)) else [src_latent]
     srcs = []
     for sl in src_list:
@@ -343,14 +370,14 @@ class Krea2EditModelPatch:
             "ref_boost_a": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01, "round": 0.001,
                                        "tooltip": "same dial for the FIRST ref (= the scene in two-ref workflows). No effect in single-ref workflows. 1.0 = off"}),
             "ref_boost_mask": ("MASK", {"tooltip": "optional region on the (last) reference to boost, e.g. the face; empty = whole reference"}),
-            "vae": ("VAE", {"tooltip": "RECOMMENDED with source_image: VAE-encodes the source in pixel space on its own native grid (no crop or resize)"}),
-            "source_image": ("IMAGE", {"tooltip": "source as IMAGE (with vae connected): preserves its native pixel grid; only patch-alignment edge padding is added"}),
+            "vae": ("VAE", {"tooltip": "RECOMMENDED with source_image: VAE-encodes the source after independently resizing H/W to the nearest 16px patch grid"}),
+            "source_image": ("IMAGE", {"tooltip": "source as IMAGE (with vae connected): no crop; H/W are independently resized to the nearest 16px patch grid"}),
             "source_image_b": ("IMAGE", {"tooltip": "legacy additional IMAGE reference; it follows every image in source_image"}),
-            # Retained for compatibility with existing workflows. Native reference
+            # Retained for compatibility with existing workflows. Patch-aligned reference
             # encoding no longer consumes it.
-            "target_latent": ("LATENT", {"tooltip": "Legacy compatibility input. Native-grid source encoding no longer depends on target resolution, so this can be left disconnected."}),
+            "target_latent": ("LATENT", {"tooltip": "Legacy compatibility input. Patch-aligned source encoding no longer depends on target resolution, so this can be left disconnected."}),
             "reference_latents": ("LATENT", {"tooltip": "additional references as an N-sample latent batch; each sample becomes its own RoPE frame"}),
-            "reference_images": ("IMAGE", {"tooltip": "additional references as an N-image batch. Requires vae; every image becomes its own RoPE frame after native-grid VAE encoding."}),
+            "reference_images": ("IMAGE", {"tooltip": "additional references as an N-image batch. Requires vae; every image becomes its own RoPE frame after patch-aligned VAE encoding."}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -375,7 +402,10 @@ class Krea2EditModelPatch:
             + _split_reference_latents(source_latent_b)
             + _split_reference_latents(reference_latents)
         )
-        src_samples = [model.model.process_latent_in(ref) for ref in latent_refs]
+        src_samples = [
+            model.model.process_latent_in(_resize_latent_to_patch_grid(ref))
+            for ref in latent_refs
+        ]
 
         px_cache = {}   # pixel-path encoded sources, one cache entry per reference
         mm = model.model  # for process_latent_in on the pixel path
@@ -391,10 +421,10 @@ class Krea2EditModelPatch:
         if image_refs:
             if vae is None:
                 raise ValueError(
-                    "krea2edit: reference image inputs require a VAE for native-grid encoding"
+                    "krea2edit: reference image inputs require a VAE for patch-aligned encoding"
                 )
             # Pixel references deliberately override latent inputs, just as the
-            # legacy source_image path did. They preserve native per-image geometry.
+            # legacy source_image path did. They keep independent per-image geometry.
             src_samples = [
                 mm.process_latent_in(
                     _encode_native_source_image(image, vae, px_cache, f"ref_{i}")
@@ -522,11 +552,10 @@ class Krea2EditGroundedEncode:
 
 
 class Krea2EditEmptyLatent:
-    """Make a Krea-compatible sampling canvas at an exact pixel size.
+    """Make a Krea-compatible sampling canvas on the nearest patch-aligned size.
 
-    The VAE receives a bottom/right padded canvas so its /8 latent grid can represent
-    any requested pixel dimensions. ``Krea2EditVAEDecode`` crops the decoded result
-    back to the requested size after sampling.
+    Requested dimensions are resized independently to the nearest 16-pixel VAE/DiT
+    lattice. ``Krea2EditVAEDecode`` returns that aligned result without cropping.
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -538,24 +567,24 @@ class Krea2EditEmptyLatent:
         }}
 
     RETURN_TYPES = ("LATENT", "INT", "INT")
-    RETURN_NAMES = ("latent", "width", "height")
+    RETURN_NAMES = ("latent", "aligned_width", "aligned_height")
     FUNCTION = "make"
     CATEGORY = "krea2edit"
-    DESCRIPTION = "Creates a sampling latent for any pixel width/height without resizing the requested output."
+    DESCRIPTION = "Creates a sampling latent at the nearest 16px-aligned width/height."
 
     def make(self, vae, width, height, batch_size=1):
-        pad_h, pad_w = (-height) % 8, (-width) % 8
+        aligned_h, aligned_w = _nearest_patch_size(height), _nearest_patch_size(width)
         pixels = torch.zeros(
-            batch_size, height + pad_h, width + pad_w, 3, dtype=torch.float32
+            batch_size, aligned_h, aligned_w, 3, dtype=torch.float32
         )
         # Ask the selected VAE for its actual latent layout instead of assuming a
         # particular channel count.  Sampling must start from noise/zero latent, not
         # the encoding of a black image, so discard the probe values afterwards.
-        return ({"samples": torch.zeros_like(vae.encode(pixels))}, width, height)
+        return ({"samples": torch.zeros_like(vae.encode(pixels))}, aligned_w, aligned_h)
 
 
 class Krea2EditVAEDecode:
-    """VAE-decode an arbitrary-size canvas and remove its alignment-only padding."""
+    """VAE-decode a canvas and return its nearest patch-aligned output size."""
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
@@ -568,16 +597,17 @@ class Krea2EditVAEDecode:
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "decode"
     CATEGORY = "krea2edit"
-    DESCRIPTION = "Decodes a Krea2Edit arbitrary-size latent and crops only alignment padding."
+    DESCRIPTION = "Decodes a Krea2Edit latent at the nearest 16px-aligned output size."
 
     def decode(self, vae, latent, width, height):
         pixels = vae.decode(latent["samples"])
-        if pixels.shape[1] < height or pixels.shape[2] < width:
-            raise ValueError(
-                "krea2edit: decoded image is smaller than the requested output size; "
-                "use the width/height emitted by Krea2EditEmptyLatent."
-            )
-        return (pixels[:, :height, :width, :],)
+        aligned_h, aligned_w = _nearest_patch_size(height), _nearest_patch_size(width)
+        if (pixels.shape[1], pixels.shape[2]) != (aligned_h, aligned_w):
+            pixels = F.interpolate(
+                pixels.movedim(-1, 1), size=(aligned_h, aligned_w),
+                mode="bilinear", align_corners=False,
+            ).movedim(1, -1)
+        return (pixels,)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -589,8 +619,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2EditModelPatch": "Krea2 Edit (source patch)",
     "Krea2EditGroundedEncode": "Krea2 Edit (grounded encode)",
-    "Krea2EditEmptyLatent": "Krea2 Edit (arbitrary-size latent)",
-    "Krea2EditVAEDecode": "Krea2 Edit (arbitrary-size VAE decode)",
+    "Krea2EditEmptyLatent": "Krea2 Edit (patch-aligned latent)",
+    "Krea2EditVAEDecode": "Krea2 Edit (patch-aligned VAE decode)",
 }
 
 

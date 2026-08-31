@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-krea2edit"
-description = "Krea 2 Identity Edit — in-context instruction-edit nodes for Krea 2: native-grid source preservation, image-grounded text conditioning, and arbitrary-size output canvases."
+description = "Krea 2 Identity Edit — in-context instruction-edit nodes for Krea 2: patch-aligned source preservation, image-grounded text conditioning, and arbitrary-size requests."
 version = "1.2.5"
 license = { file = "LICENSE" }
 readme = "README.md"

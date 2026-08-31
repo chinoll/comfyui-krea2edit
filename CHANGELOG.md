@@ -7,10 +7,13 @@ weights via `fit_mode: crop`.
 ## Unreleased
 
 ### Added
-- **Exact arbitrary-size output:** `Krea2EditEmptyLatent` makes a VAE-aligned
-  sampling canvas for any positive requested pixel width/height, and
-  `Krea2EditVAEDecode` removes only the bottom/right alignment pad after decoding.
-  The bundled workflow now uses this pair, including its exact-dimension wiring.
+- **Arbitrary requested output:** `Krea2EditEmptyLatent` makes a sampling canvas by
+  independently rounding H/W to the nearest 16px VAE/DiT grid. `Krea2EditVAEDecode`
+  returns that aligned result directly. The bundled workflow now uses this pair.
+
+### Changed
+- Source references use the same nearest-16px independent-axis resize instead of
+  bottom/right edge padding. Neither input nor output is cropped.
 
 ## v1.2.5 — 2026-07-29
 

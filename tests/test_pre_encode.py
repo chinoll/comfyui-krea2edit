@@ -7,9 +7,9 @@ wrapper, that victim was the diffusion model the sampler was in the middle of us
 nothing re-expands it (`sampler_helpers` loads once, before the loop). The rest of the run
 then streamed weights from CPU on every step.
 
-Native-grid sources are encoded at node-execution time, before the sampler loads
+Patch-aligned sources are encoded at node-execution time, before the sampler loads
 anything, because their encoding no longer depends on the target resolution. These
-tests pin that timing and the no-crop, edge-padding-only geometry.
+tests pin that timing and the no-crop, nearest-grid-resize geometry.
 
 Self-contained: installs a minimal ComfyUI stub when the real one is not importable, so
 it runs both inside a ComfyUI checkout and standalone.
@@ -187,10 +187,10 @@ def test_target_latent_is_not_needed_for_preencode():
     vae = _FakeVAE()
     wrapper = _patch(mod, vae=vae, source_image=_image())
 
-    assert len(vae.calls) == 1, "native-grid source must encode without target_latent"
+    assert len(vae.calls) == 1, "patch-aligned source must encode without target_latent"
 
     _run_steps(wrapper)
-    assert len(vae.calls) == 1, "sampling must reuse the native-grid source"
+    assert len(vae.calls) == 1, "sampling must reuse the patch-aligned source"
 
 
 def test_both_references_are_pre_encoded():
@@ -242,7 +242,17 @@ def test_reference_latent_batches_expand_to_multiple_refs_in_order():
     assert isinstance(seen[0], list) and len(seen[0]) == 6
 
 
-def test_target_latent_does_not_change_native_source_geometry():
+def test_direct_latent_source_resizes_to_nearest_dit_patch_grid():
+    mod = _load_pack()
+    seen = []
+    _stub_forward(mod, seen)
+    wrapper = _patch(mod, source_latent=_latent(h=65, w=97))
+
+    _run_steps(wrapper)
+    assert seen[0].shape == (1, 4, 66, 98)
+
+
+def test_target_latent_does_not_change_patch_aligned_source_geometry():
     mod = _load_pack()
     seen = []
     _stub_forward(mod, seen)
@@ -256,17 +266,17 @@ def test_target_latent_does_not_change_native_source_geometry():
     assert seen[0].shape == (1, 4, 64, 64)
 
 
-def test_pixel_source_keeps_its_native_grid_with_only_edge_padding():
+def test_pixel_source_resizes_to_its_nearest_patch_grid():
     mod = _load_pack()
     seen = []
     _stub_forward(mod, seen)
     vae = _FakeVAE()
     wrapper = _patch(mod, vae=vae, source_image=_image(513, 777), target_latent=_latent(32, 32))
 
-    # 513x777 is padded (not cropped/resized) to the next 16-pixel lattice.
-    assert vae.calls == [(1, 528, 784, 3)]
+    # 513x777 is independently resized to the nearest (not ceiling) 16-pixel lattice.
+    assert vae.calls == [(1, 512, 784, 3)]
     _run_steps(wrapper)
-    assert seen[0].shape == (1, 4, 66, 98)
+    assert seen[0].shape == (1, 4, 64, 98)
 
 
 def test_target_latent_without_pixel_path_is_inert():
@@ -279,20 +289,20 @@ def test_target_latent_without_pixel_path_is_inert():
     assert seen[0].shape == (1, 4, 64, 64)
 
 
-def test_arbitrary_size_canvas_round_trips_exact_pixel_size():
-    """The sampling canvas may be any HxW; only its VAE alignment pad is removed."""
+def test_arbitrary_size_canvas_resizes_to_nearest_patch_grid():
+    """Requested dimensions become the nearest 16px-aligned sampling/output grid."""
     mod = _load_pack()
     vae = _FakeVAE()
 
     latent, width, height = mod.Krea2EditEmptyLatent().make(vae, 513, 777)
 
-    # The VAE works on the /8 ceiling grid.  The requested geometry is preserved
-    # separately so decode can remove only the bottom/right alignment pixels.
-    assert vae.calls == [(1, 784, 520, 3)]
-    assert latent["samples"].shape == (1, 4, 98, 65)
+    # 513x777 becomes 512x784: no hidden pad/crop path remains in this workflow.
+    assert vae.calls == [(1, 784, 512, 3)]
+    assert (width, height) == (512, 784)
+    assert latent["samples"].shape == (1, 4, 98, 64)
 
     (image,) = mod.Krea2EditVAEDecode().decode(vae, latent, width, height)
-    assert image.shape == (1, 777, 513, 3)
+    assert image.shape == (1, 784, 512, 3)
 
 
 def test_grounded_encode_keeps_image_grounded_text_but_removes_visual_positions():

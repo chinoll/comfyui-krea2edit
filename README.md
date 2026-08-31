@@ -7,11 +7,10 @@ into the Qwen3-VL text encoder (semantic grounding). The VLM's visual-patch hidd
 states are then removed, so only image-grounded language-token states enter the DiT.
 Source latent tokens receive the clean endpoint `t=0` AdaLN modulation, while target
 tokens receive the sampler's current timestep; attention still runs over both blocks.
-Each image has an independent RoPE grid: references keep their native aspect ratio and
-begin at `(h=0, w=0)` in their own frame. The node never crops or resizes a reference;
-it adds only bottom/right edge padding needed for the 16-pixel VAE/DiT lattice.
-Target canvases may likewise use any requested pixel width and height; their temporary
-VAE/DiT alignment padding is cropped from the final decoded image.
+Each image has an independent RoPE grid and begins at `(h=0, w=0)` in its own frame.
+For VAE/DiT alignment, each reference's H and W are independently resized to the
+nearest 16-pixel lattice — no crop or edge padding. Target requests use the same rule,
+so the generated output is always patch-aligned rather than padded and cropped back.
 
 ☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU compute for future versions.
 
@@ -19,7 +18,8 @@ VAE/DiT alignment padding is cropped from the final decoded image.
 
 ## Model versions
 
-This native-grid fork requires a LoRA trained with the paired native-grid trainer. It
+This patch-aligned independent-grid fork requires a LoRA trained with the paired
+patch-aligned trainer. It
 is not geometry-compatible with released v1/v1.1/v1.2 Identity Edit LoRAs, which used
 target-fitted or cropped references.
 
@@ -46,15 +46,15 @@ non-causal and the RoPE positions are unchanged. Inputs:
 - `source_latent` / `source_latent_b` — legacy primary/additional references. A
   latent batch is split so each batch item becomes one reference.
 - `reference_latents` — additional references as an N-sample latent batch.
-- `vae` + `source_image` *(optional, recommended)* — VAE-encodes the original source
-  image in pixel space, preserving its native aspect ratio and resolution. It is only
-  edge-padded to the 16-pixel patch lattice; no crop or resize is performed.
+- `vae` + `source_image` *(optional, recommended)* — VAE-encodes the source image in
+  pixel space after independently resizing H/W to their nearest 16-pixel patch-grid
+  values. It is not cropped or edge-padded.
 - `source_image_b` — legacy additional image reference.
 - `reference_images` — additional references as an N-image batch. Each image becomes
-  a separate native-grid reference; its order must match the text node. A standard
+  a separate patch-aligned reference; its order must match the text node. A standard
   ComfyUI IMAGE batch has one shared image size; list-producing nodes may also pass a
   list of differently sized IMAGE batches.
-- `target_latent` *(optional, legacy compatibility)* — no longer needed: native-grid
+- `target_latent` *(optional, legacy compatibility)* — no longer needed: patch-aligned
   source encoding does not depend on output resolution.
 - `ref_boost` *(default 1.0)* — reference-fidelity dial; >1 pulls harder toward the
   reference's appearance, <1 loosens. `ref_boost_a` is the same dial for the scene ref in two-ref edits.
@@ -79,16 +79,14 @@ image semantically and quality drops sharply, especially for scene-referential
 instructions ("the man on the left").
 
 ### `Krea2EditEmptyLatent` + `Krea2EditVAEDecode`
-Use this pair instead of `EmptySD3LatentImage` + the stock VAE decode when the output
-must be an exact arbitrary pixel size (for example 513 × 777). The empty-latent node
-creates the VAE's ceiling `/8` sampling grid and emits the requested `width` and
-`height`; connect those two values to the matching inputs of the decode node. The
-decoder removes only the bottom/right alignment area, so the returned IMAGE has
-exactly the requested dimensions.
+Use this pair instead of `EmptySD3LatentImage` + the stock VAE decode for an arbitrary
+requested size. The empty-latent node rounds each requested axis independently to the
+nearest 16-pixel VAE/DiT grid and emits that actual aligned `width` and `height`;
+connect them to the decode node. For example, 513 × 777 becomes **512 × 784**. The
+decoder returns this aligned size directly — there is no hidden padding or final crop.
 
 The supplied VAE is probed only to obtain its latent layout; sampling still begins
-from a zero/noise latent as usual. The target DiT path independently pads an odd
-latent grid to its 2×2 patch lattice and crops that internal pad before VAE decode.
+from a zero/noise latent as usual. Its latent grid is already 2×2 DiT-patch aligned.
 
 ## Minimal wiring
 
@@ -112,11 +110,11 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
 ## Usage notes (read these — they matter)
 
 1. **Aspect ratio.** Source and output may use different aspect ratios. Each reference
-   has its own `(frame, h, w)` RoPE grid and is never fitted to the output grid. Larger
-   source images create more reference tokens, so keep their native resolution within
-   your VRAM budget. The pixel path accepts arbitrary source H×W; use
-   `grounding_px: 0` if the VLM semantic path must also retain the native resolution
-   (otherwise it only downsizes that semantic copy).
+   has its own `(frame, h, w)` RoPE grid and is never fitted to the output grid. For
+   patch alignment, each source axis is rounded to its nearest 16px size; this causes
+   only slight independent-axis scaling and no crop. Larger source images create more
+   reference tokens, so keep their resolution within your VRAM budget. Use
+   `grounding_px: 0` if the VLM semantic copy must retain its original resolution.
 2. **Turbo, 8 steps, CFG 1** is the fast path (~1 min at 2MP) and works for most
    edits: recolor, add/insert, attribute changes, restyles, scene translation.
 3. **Removals and other "delete salient content" edits need real guidance:**
@@ -129,10 +127,10 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
    Feed the exact same ordered image set to `Krea2EditGroundedEncode`. Each reference
    gets frame `1…N`; `ref_boost` and `ref_boost_mask` apply to the final reference,
    while `ref_boost_a` applies to all earlier references.
-6. **No fixed output resolution.** Any pixel width and height can be requested with
-   the arbitrary-size latent/decode pair. Around and above 2MP, however, token count,
-   VRAM, run time, and out-of-training-range artifacts (content bleed or duplication)
-   all rise quickly.
+6. **No fixed requested resolution.** Any pixel width and height can be requested with
+   the arbitrary-size latent/decode pair; the result is the nearest 16px-aligned size.
+   Around and above 2MP, token count, VRAM, run time, and out-of-training-range
+   artifacts (content bleed or duplication) all rise quickly.
 7. **Two distinct people:** place both references in a single pass (scene/subject A on
    the main inputs, subject B on the `_b` inputs) rather than adding them one at a time —
    simultaneous placement is currently more reliable than chaining separate edits. Face
@@ -141,14 +139,13 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
 ## Pixel path and VRAM
 
 The pixel path VAE-encodes each source once at node-execution time, before sampling,
-on that source's native pixel grid. It needs no target resolution and therefore no
-longer needs `target_latent`. The source is padded only on its bottom/right edge to a
-multiple of 16 pixels; it is not cropped or resampled.
+on that source's own patch-aligned grid. It needs no target resolution and therefore no
+longer needs `target_latent`. The source is independently resized to the nearest
+multiple of 16 pixels; it is not cropped or edge-padded.
 
-For target output, `Krea2EditEmptyLatent` supports every positive pixel H×W. It makes
-only the invisible VAE `/8` alignment canvas; `Krea2EditVAEDecode` crops the decoded
-result back to the exact requested H×W. The DiT uses a second, internal 2×2-latent
-alignment pad when required and removes it before decode.
+For target output, `Krea2EditEmptyLatent` accepts every positive pixel H×W and rounds
+each dimension to the nearest 16px lattice. `Krea2EditVAEDecode` returns that aligned
+image directly, with no padding/crop restoration step.
 
 More references increase both DiT sequence length and VLM work. Keep the aggregate
 reference resolution within your VRAM/context budget.
@@ -156,11 +153,11 @@ reference resolution within your VRAM/context budget.
 The console tells you which path you got:
 
 ```
-[krea2edit] native source VAE encode: (513, 777) -> (528, 784) px (edge padding only)
+[krea2edit] patch-aligned source VAE encode: (513, 777) -> (512, 784) px (nearest 16px resize)
 ```
 
-You may instead supply `source_latent` directly. Its native latent grid is used as-is,
-apart from DiT patch alignment padding.
+You may instead supply `source_latent` directly. Odd latent H/W values are independently
+resized to the nearest 2×2 DiT-patch grid.
 
 ## License / credits
 
