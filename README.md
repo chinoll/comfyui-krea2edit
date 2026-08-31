@@ -5,6 +5,8 @@ the **Krea 2 Identity Edit** LoRA. Turns Krea 2 (Raw or Turbo) into an image edi
 conditioning: the source image is injected both as VAE latent tokens (appearance) and
 into the Qwen3-VL text encoder (semantic grounding). The VLM's visual-patch hidden
 states are then removed, so only image-grounded language-token states enter the DiT.
+Source latent tokens receive the clean endpoint `t=0` AdaLN modulation, while target
+tokens receive the sampler's current timestep; attention still runs over both blocks.
 
 ☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU compute for future versions.
 
@@ -30,8 +32,10 @@ LoRA (`krea2_identity_edit_v1_2.safetensors`). No extra Python dependencies.
 ## Nodes
 
 ### `Krea2EditModelPatch`
-Wraps the diffusion model so the VAE-encoded source image is prepended as clean
-in-context tokens (RoPE frame 1). Inputs:
+Wraps the diffusion model so the VAE-encoded source image is added as clean
+in-context tokens (RoPE frame 1, `t=0` block modulation). It is internally placed
+after the target block only to use Krea2's native clean-time routing; attention is
+non-causal and the RoPE positions are unchanged. Inputs:
 - `model` — Krea 2 (LoRA already applied)
 - `source_latent` — VAEEncode of the image being edited
 - `source_latent_b` *(optional)* — second reference (RoPE frame 2) for two-input

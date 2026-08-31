@@ -2,11 +2,11 @@
 
 ComfyUI's native Krea2 `_forward` is text-to-image only: it builds the sequence
 `[text | target]`. The krea2_edit LoRA (trained in ai-toolkit) needs the *appearance
-path*: the VAE-encoded SOURCE latent prepended as a block of clean tokens, distinguished
-from the (noisy) target purely by the 3-axis RoPE frame index (source=1, target=0, h/w
-aligned). This node adds that by wrapping the model's DIFFUSION_MODEL forward and rebuilding
-the sequence as `[text | source(frame=1) | target(frame=0)]`, keeping only the target tokens
-out — mirroring ai-toolkit's `predict_velocity_edit` exactly, using the model's own submodules.
+path*: the VAE-encoded SOURCE latent is a block of clean tokens, distinguished from the
+(noisy) target by the 3-axis RoPE frame index (source=1, target=0, h/w aligned) and by
+its `t=0` block modulation. This node uses `[text | target(frame=0) | source(frame=1)]`
+internally so native Krea2 can route the source suffix to `t=0`; self-attention is
+non-causal and the RoPE IDs are unchanged. Only target tokens are returned.
 
 Wiring:  LoadImage -> VAEEncode(source) --\
                                             Krea2EditModelPatch(model, source_latent) -> KSampler
@@ -238,7 +238,7 @@ def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop"):
 
 
 def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, dtype):
-    """Additive attention-logit bias on the [text | refs... | target] sequence.
+    """Additive attention-logit bias on the [text | target | refs...] sequence.
 
     boosts: per-ref factor on target->ref attention, aligned with the source blocks
     (last entry = last ref = the subject by workflow convention). Equivalent to
@@ -247,11 +247,14 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
     to a region (e.g. the face).
     """
     nsrc = len(slens)
-    offs = [txtlen]
+    # Reference tokens live after target tokens so ComfyUI's native Krea2 block can
+    # efficiently apply a separate t=0 modulation to the contiguous suffix.
+    target_start = txtlen
+    target_end = target_start + tgtlen
+    offs = [target_end]
     for sl in slens:
         offs.append(offs[-1] + sl)
-    rows0 = offs[-1]
-    L = rows0 + tgtlen
+    L = offs[-1]
     bias = torch.zeros(1, 1, L, L, device=device, dtype=dtype)
     for i, b in enumerate(boosts):
         if b == 1.0:
@@ -265,19 +268,20 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
             cols = off + torch.nonzero(mask.reshape(-1) > 0.5, as_tuple=True)[0].to(device)
         else:
             cols = torch.arange(off, off + sl, device=device)
-        bias[:, :, rows0:, cols] = math.log(max(b, 1e-4))
+        bias[:, :, target_start:target_end, cols] = math.log(max(b, 1e-4))
     return bias
 
 
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
                        ref_boost=1.0, ref_boost_a=1.0, ref_boost_mask=None,
                        ref_native=False, pos_mode="anchor"):
-    """Krea2 SingleStreamDiT._forward, but with source block(s) prepended.
+    """Krea2 SingleStreamDiT._forward with clean-time source token blocks.
 
     m           : the SingleStreamDiT (LoRA-patched at sample time)
     x           : (B,C,H,W) or (B,C,T,H,W) noisy TARGET latent
     src_latent  : clean SOURCE latent (VAE-encoded), 4D/5D — or a LIST of them
-                  (multi-ref: [scene, subject], frames 1..N, training-matched)
+                  (multi-ref: [scene, subject], frames 1..N). Their block-level
+                  time modulation is explicitly t=0, unlike noisy target tokens.
     context     : (B, seq, txtlayers*txtdim) — the 12-layer Qwen3-VL stack
     """
     patch = m.patch
@@ -315,13 +319,22 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
 
     t = m.tmlp(timestep_embedding(timesteps, m.tdim).unsqueeze(1).to(tgt_img.dtype))
     tvec = m.tproj(t)
+    t_clean = m.tmlp(
+        timestep_embedding(torch.zeros_like(timesteps), m.tdim).unsqueeze(1).to(tgt_img.dtype)
+    )
+    # ComfyUI's native Krea2 block accepts a 2B modulation stack and applies its
+    # second half to the suffix selected by ``timestep_zero_index``. This avoids a
+    # B x sequence x 6D allocation and preserves full ref<->target self-attention.
+    tvec = torch.cat((tvec, m.tproj(t_clean)), dim=0)
 
     context = m.txtfusion(context, mask=None, transformer_options=transformer_options)
     context = m.txtmlp(context)
 
     txtlen, tgtlen = context.shape[1], tgt_img.shape[1]
-    srclen = sum(si.shape[1] for si in src_imgs)
-    combined = torch.cat([context] + src_imgs + [tgt_img], dim=1)  # [text | refs... | target]
+    # Put refs in a contiguous suffix. Self-attention has no causal ordering, and
+    # RoPE position IDs remain unchanged, so this only enables native t=0 routing.
+    combined = torch.cat([context, tgt_img] + src_imgs, dim=1)  # [text | target | refs...]
+    timestep_zero_index = txtlen + tgtlen
 
     device = combined.device
     if pos_mode == "stride1" and ref_native:
@@ -332,8 +345,8 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
         ref_ids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(src_grids)]
     pos = torch.cat([
         torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)]   # text @ 0
-        + ref_ids
-        + [_imgids(bs, 0, h_, w_, device)],                                    # target frame=0
+        + [_imgids(bs, 0, h_, w_, device)]                                    # target frame=0
+        + ref_ids,
         dim=1)
     freqs = m.pe_embedder(pos)
 
@@ -346,10 +359,25 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
                                    src_grids, combined.device, combined.dtype)
 
     for block in m.blocks:
-        combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
+        try:
+            combined = block(
+                combined,
+                tvec,
+                freqs,
+                attn_bias,
+                timestep_zero_index=timestep_zero_index,
+                transformer_options=transformer_options,
+            )
+        except TypeError as exc:
+            raise RuntimeError(
+                "krea2edit: separate reference t=0 conditioning requires a current "
+                "ComfyUI Krea2 implementation with SingleStreamBlock.timestep_zero_index. "
+                "Update ComfyUI and restart it."
+            ) from exc
 
-    final = m.last(combined, t)
-    out = final[:, txtlen + srclen: txtlen + srclen + tgtlen, :]         # target tokens only
+    # LastLayer has no cross-token interaction. Run it only on target states with
+    # target t, because reference outputs are intentionally discarded.
+    out = m.last(combined[:, txtlen:txtlen + tgtlen], t)
     out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
                     h=h_, w=w_, ph=patch, pw=patch, c=m.channels)
     out = out[:, :, :H_orig, :W_orig]
@@ -384,7 +412,7 @@ class Krea2EditModelPatch:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
     CATEGORY = "krea2edit"
-    DESCRIPTION = "Adds the krea2_edit in-context source-preservation path (source latent as frame=1 tokens) to a Krea2 model."
+    DESCRIPTION = "Adds Krea2Edit source preservation (frame=1, clean t=0 source tokens) to a Krea2 model."
 
     def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
