@@ -36,17 +36,22 @@ LoRA (`krea2_identity_edit_v1_2.safetensors`). No extra Python dependencies.
 ## Nodes
 
 ### `Krea2EditModelPatch`
-Wraps the diffusion model so the VAE-encoded source image is added as clean
-in-context tokens (RoPE frame 1, `t=0` block modulation). It is internally placed
+Wraps the diffusion model so every VAE-encoded reference is added as clean
+in-context tokens (RoPE frames 1…N, `t=0` block modulation). It is internally placed
 after the target block only to use Krea2's native clean-time routing; attention is
 non-causal and the RoPE positions are unchanged. Inputs:
 - `model` — Krea 2 (LoRA already applied)
-- `source_latent` — VAEEncode of the image being edited
-- `source_latent_b` *(optional)* — second reference (RoPE frame 2) for two-input
-  edits (e.g. person + scene)
+- `source_latent` / `source_latent_b` — legacy primary/additional references. A
+  latent batch is split so each batch item becomes one reference.
+- `reference_latents` — additional references as an N-sample latent batch.
 - `vae` + `source_image` *(optional, recommended)* — VAE-encodes the original source
   image in pixel space, preserving its native aspect ratio and resolution. It is only
   edge-padded to the 16-pixel patch lattice; no crop or resize is performed.
+- `source_image_b` — legacy additional image reference.
+- `reference_images` — additional references as an N-image batch. Each image becomes
+  a separate native-grid reference; its order must match the text node. A standard
+  ComfyUI IMAGE batch has one shared image size; list-producing nodes may also pass a
+  list of differently sized IMAGE batches.
 - `target_latent` *(optional, legacy compatibility)* — no longer needed: native-grid
   source encoding does not depend on output resolution.
 - `ref_boost` *(default 1.0)* — reference-fidelity dial; >1 pulls harder toward the
@@ -59,8 +64,9 @@ conditioning reaches the DiT, while the remaining language-token states retain t
 VLM's image grounding. Inputs:
 - `clip` — the Krea 2 CLIP (Qwen3-VL, loaded with `type: krea2`)
 - `prompt` — the edit instruction ("recolor the car to matte black")
-- `image` — the same source image
-- `image_b` *(optional)* — second reference for two-input edits
+- `image` / `image_b` — primary and legacy additional references
+- `reference_images` — additional references as an N-image batch. Connect the same
+  images in exactly the same order as the model-patch node.
 - `grounding_px` — grounding resolution (default 768; v1.2 trained range
   384–768, and 1024+ often still works nicely). This is a quality dial: lower =
   stronger edit adherence, higher = stronger identity/likeness. Try 1024 for
@@ -98,8 +104,11 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
    usually re-render the subject instead of removing it.
 4. At CFG > 1, ground the negative too: a second `Krea2EditGroundedEncode` with an
    empty prompt and the same image (this is the trained unconditional).
-5. Two-input edits: scene image → `source_latent`/`image`, subject image →
-   `source_latent_b`/`image_b`. Leave the b-inputs unconnected for single-image use.
+5. **Multi-reference order matters.** A source/image batch is split in batch order;
+   then `source_*_b` / `image_b`; then `reference_latents` / `reference_images`.
+   Feed the exact same ordered image set to `Krea2EditGroundedEncode`. Each reference
+   gets frame `1…N`; `ref_boost` and `ref_boost_mask` apply to the final reference,
+   while `ref_boost_a` applies to all earlier references.
 6. **Generate at ≤2MP.** Above the trained range, source content can bleed into
    the output or subjects duplicate.
 7. **Two distinct people:** place both references in a single pass (scene/subject A on
@@ -113,6 +122,9 @@ The pixel path VAE-encodes each source once at node-execution time, before sampl
 on that source's native pixel grid. It needs no target resolution and therefore no
 longer needs `target_latent`. The source is padded only on its bottom/right edge to a
 multiple of 16 pixels; it is not cropped or resampled.
+
+More references increase both DiT sequence length and VLM work. Keep the aggregate
+reference resolution within your VRAM/context budget.
 
 The console tells you which path you got:
 

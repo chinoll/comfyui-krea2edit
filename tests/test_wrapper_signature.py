@@ -65,11 +65,20 @@ class _FakeModelPatcher:
         return c
 
 
+class _FakeSamples:
+    """Minimal 4D latent batch for wrapper-only tests (no tensor dependency)."""
+    ndim = 4
+    shape = (1, 4, 1, 1)
+
+    def __getitem__(self, _index):
+        return self
+
+
 def _get_wrapper(mod):
     import comfy.patcher_extension as pe
 
     node = mod.Krea2EditModelPatch()
-    (m,) = node.patch(_FakeModelPatcher(), {"samples": object()})
+    (m,) = node.patch(_FakeModelPatcher(), {"samples": _FakeSamples()})
     to = m.model_options["transformer_options"]
     return to["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit"][0]
 

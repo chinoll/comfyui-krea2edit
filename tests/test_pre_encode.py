@@ -128,19 +128,20 @@ class _FakeModelPatcher:
         return c
 
 
-def _latent(h=64, w=64):
-    return {"samples": torch.zeros(1, 4, h, w)}
+def _latent(h=64, w=64, batch=1):
+    return {"samples": torch.zeros(batch, 4, h, w)}
 
 
-def _image(h=512, w=None):
-    return torch.zeros(1, h, h if w is None else w, 3)
+def _image(h=512, w=None, batch=1):
+    return torch.zeros(batch, h, h if w is None else w, 3)
 
 
 def _patch(mod, **kwargs):
     import comfy.patcher_extension as pe
 
     node = mod.Krea2EditModelPatch()
-    (m,) = node.patch(_FakeModelPatcher(), _latent(), **kwargs)
+    source_latent = kwargs.pop("source_latent", _latent())
+    (m,) = node.patch(_FakeModelPatcher(), source_latent, **kwargs)
     to = m.model_options["transformer_options"]
     return to["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit"][0]
 
@@ -201,6 +202,40 @@ def test_both_references_are_pre_encoded():
     _run_steps(wrapper)
     assert len(vae.calls) == 2
     assert isinstance(seen[0], list) and len(seen[0]) == 2
+
+
+def test_reference_image_batches_expand_to_multiple_refs_in_order():
+    mod = _load_pack()
+    seen = []
+    _stub_forward(mod, seen)
+    vae = _FakeVAE()
+    wrapper = _patch(
+        mod,
+        vae=vae,
+        source_image=_image(batch=2),
+        source_image_b=_image(batch=1),
+        reference_images=_image(batch=3),
+    )
+
+    assert len(vae.calls) == 6
+    assert all(call == (1, 512, 512, 3) for call in vae.calls)
+    _run_steps(wrapper)
+    assert isinstance(seen[0], list) and len(seen[0]) == 6
+
+
+def test_reference_latent_batches_expand_to_multiple_refs_in_order():
+    mod = _load_pack()
+    seen = []
+    _stub_forward(mod, seen)
+    wrapper = _patch(
+        mod,
+        source_latent=_latent(batch=2),
+        source_latent_b=_latent(batch=1),
+        reference_latents=_latent(batch=3),
+    )
+
+    _run_steps(wrapper)
+    assert isinstance(seen[0], list) and len(seen[0]) == 6
 
 
 def test_target_latent_does_not_change_native_source_geometry():
@@ -275,6 +310,35 @@ def test_grounded_encode_keeps_image_grounded_text_but_removes_visual_positions(
     assert cond.tolist() == [[[0.0, 1.0], [4.0, 5.0]]]
     assert options["attention_mask"].tolist() == [[1, 0]]
     assert "build_image_inputs" not in clip.vlm.__dict__, "temporary capture hook must be removed"
+
+
+def test_grounded_encode_expands_all_reference_image_batches():
+    mod = _load_pack()
+    seen = {}
+
+    class _FakeClip:
+        def tokenize(self, prompt, images, llama_template):
+            seen["prompt"] = prompt
+            seen["images"] = images
+            seen["template"] = llama_template
+            return object()
+
+    original = mod._encode_grounded_text_only
+    mod._encode_grounded_text_only = lambda _clip, _tokens: "grounded"
+    try:
+        result = mod.Krea2EditGroundedEncode().encode(
+            _FakeClip(),
+            "combine the references",
+            image=_image(batch=2),
+            image_b=_image(batch=1),
+            reference_images=_image(batch=3),
+        )
+    finally:
+        mod._encode_grounded_text_only = original
+
+    assert result == ("grounded",)
+    assert len(seen["images"]) == 6
+    assert seen["template"].count("<|vision_start|>") == 6
 
 
 if __name__ == "__main__":

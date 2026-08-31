@@ -2,10 +2,10 @@
 
 ComfyUI's native Krea2 `_forward` is text-to-image only: it builds the sequence
 `[text | target]`. The krea2_edit LoRA (trained in ai-toolkit) needs the *appearance
-path*: the VAE-encoded SOURCE latent is a block of clean tokens, distinguished from the
-(noisy) target by the 3-axis RoPE frame index (source=1, target=0, h/w aligned) and by
-its `t=0` block modulation. This node uses `[text | target(frame=0) | source(frame=1)]`
-internally so native Krea2 can route the source suffix to `t=0`; self-attention is
+path*: every VAE-encoded SOURCE latent is a clean token block, distinguished from the
+(noisy) target by a 3-axis RoPE frame index (references=1..N, target=0) and its `t=0`
+block modulation. This node uses `[text | target(frame=0) | refs(frame=1..N)]`
+internally so native Krea2 can route the reference suffix to `t=0`; self-attention is
 non-causal and the RoPE IDs are unchanged. Only target tokens are returned.
 
 Wiring:  LoadImage -> VAEEncode(source) --\
@@ -142,6 +142,31 @@ def _to_4d(v):
         b, c, t, h, w = v.shape
         return v.reshape(b * t, c, h, w)
     return v
+
+
+def _split_reference_images(images):
+    """Normalize an IMAGE batch (or a list of batches) into B=1 reference images."""
+    if images is None:
+        return []
+    if isinstance(images, (list, tuple)):
+        return [ref for group in images for ref in _split_reference_images(group)]
+    if not torch.is_tensor(images) or images.ndim != 4:
+        raise ValueError(
+            "krea2edit: reference_images must be an IMAGE batch shaped (N,H,W,C)"
+        )
+    return [images[i:i + 1] for i in range(images.shape[0])]
+
+
+def _split_reference_latents(latent):
+    """Normalize a LATENT batch into B=1 reference latents."""
+    if latent is None:
+        return []
+    samples = latent["samples"]
+    if samples.ndim != 4:
+        raise ValueError(
+            "krea2edit: reference_latents must contain samples shaped (N,C,H,W)"
+        )
+    return [samples[i:i + 1] for i in range(samples.shape[0])]
 
 
 def _encode_native_source_image(image, vae, cache, key):
@@ -309,9 +334,9 @@ class Krea2EditModelPatch:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": ("MODEL",),
-            "source_latent": ("LATENT",),
         }, "optional": {
-            "source_latent_b": ("LATENT", {"tooltip": "2nd reference (subject photo) for multi-ref LoRAs -> RoPE frame=2, training-matched order: scene first, subject second"}),
+            "source_latent": ("LATENT", {"tooltip": "primary reference latent; a latent batch is treated as multiple references"}),
+            "source_latent_b": ("LATENT", {"tooltip": "legacy additional latent reference; it follows every sample in source_latent"}),
             "ref_boost": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01, "round": 0.001,
                                      "tooltip": "reference-fidelity dial: multiplies target->reference attention. Applies to the LAST ref (= the subject in two-ref workflows, the only ref in single-ref). 1.0 = off, >1 pulls harder toward the reference's appearance, <1 loosens. Optimal value is model-specific"}),
             "ref_boost_a": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01, "round": 0.001,
@@ -319,31 +344,37 @@ class Krea2EditModelPatch:
             "ref_boost_mask": ("MASK", {"tooltip": "optional region on the (last) reference to boost, e.g. the face; empty = whole reference"}),
             "vae": ("VAE", {"tooltip": "RECOMMENDED with source_image: VAE-encodes the source in pixel space on its own native grid (no crop or resize)"}),
             "source_image": ("IMAGE", {"tooltip": "source as IMAGE (with vae connected): preserves its native pixel grid; only patch-alignment edge padding is added"}),
-            "source_image_b": ("IMAGE", {"tooltip": "2nd reference as IMAGE (with vae)"}),
+            "source_image_b": ("IMAGE", {"tooltip": "legacy additional IMAGE reference; it follows every image in source_image"}),
             # Retained for compatibility with existing workflows. Native reference
             # encoding no longer consumes it.
             "target_latent": ("LATENT", {"tooltip": "Legacy compatibility input. Native-grid source encoding no longer depends on target resolution, so this can be left disconnected."}),
+            "reference_latents": ("LATENT", {"tooltip": "additional references as an N-sample latent batch; each sample becomes its own RoPE frame"}),
+            "reference_images": ("IMAGE", {"tooltip": "additional references as an N-image batch. Requires vae; every image becomes its own RoPE frame after native-grid VAE encoding."}),
         }}
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
     CATEGORY = "krea2edit"
-    DESCRIPTION = "Adds Krea2Edit source preservation (frame=1, clean t=0 source tokens) to a Krea2 model."
+    DESCRIPTION = "Adds Krea2Edit source preservation with any number of clean t=0 reference frames to a Krea2 model."
 
-    def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
+    def patch(self, model, source_latent=None, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
-              source_image_b=None, target_latent=None, **_future):
+              source_image_b=None, target_latent=None, reference_latents=None,
+              reference_images=None, **_future):
         if _future:
             print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
                   f"know ({', '.join(sorted(_future))}). The workflow is newer than the "
                   f"installed node pack. Update comfyui-krea2edit (Manager -> Update, or git "
                   f"pull) and restart ComfyUI. Continuing without them.", flush=True)
         m = model.clone()
-        # The target latent reaches the diffusion model already scaled (process_latent_in);
-        # scale the source(s) the same way so all share one latent space.
-        src_samples = model.model.process_latent_in(source_latent["samples"])
-        if source_latent_b is not None:
-            src_samples = [src_samples, model.model.process_latent_in(source_latent_b["samples"])]
+        # A latent/image batch is an ordered batch of REFERENCES, not sampler batch
+        # items. Each is split to B=1 before the DiT receives its own RoPE frame.
+        latent_refs = (
+            _split_reference_latents(source_latent)
+            + _split_reference_latents(source_latent_b)
+            + _split_reference_latents(reference_latents)
+        )
+        src_samples = [model.model.process_latent_in(ref) for ref in latent_refs]
 
         px_cache = {}   # pixel-path encoded sources, one cache entry per reference
         mm = model.model  # for process_latent_in on the pixel path
@@ -351,17 +382,30 @@ class Krea2EditModelPatch:
         # Native-grid sources do not depend on output resolution, so always encode
         # outside the sampling window. This also makes target_latent unnecessary;
         # preserve that input only so older workflows retain their socket layout.
-        if vae is not None and source_image is not None:
-            src_samples = mm.process_latent_in(
-                _encode_native_source_image(source_image, vae, px_cache, "a")
+        image_refs = (
+            _split_reference_images(source_image)
+            + _split_reference_images(source_image_b)
+            + _split_reference_images(reference_images)
+        )
+        if image_refs:
+            if vae is None:
+                raise ValueError(
+                    "krea2edit: reference image inputs require a VAE for native-grid encoding"
+                )
+            # Pixel references deliberately override latent inputs, just as the
+            # legacy source_image path did. They preserve native per-image geometry.
+            src_samples = [
+                mm.process_latent_in(
+                    _encode_native_source_image(image, vae, px_cache, f"ref_{i}")
+                )
+                for i, image in enumerate(image_refs)
+            ]
+        if not src_samples:
+            raise ValueError(
+                "krea2edit: connect at least one source/reference latent or image"
             )
-            if source_image_b is not None:
-                src_samples = [
-                    src_samples,
-                    mm.process_latent_in(
-                        _encode_native_source_image(source_image_b, vae, px_cache, "b")
-                    ),
-                ]
+        if len(src_samples) == 1:
+            src_samples = src_samples[0]
 
         def wrapper(executor, x, timesteps, context, *wargs, **kwargs):
             # ComfyUI signature drift (2026-07-19, commit c9602625 adds ref_latents):
@@ -434,7 +478,8 @@ class Krea2EditGroundedEncode:
             },
             "optional": {
                 "image": ("IMAGE",),
-                "image_b": ("IMAGE", {"tooltip": "2nd reference (subject) for multi-ref LoRAs; vision blocks in training order: scene, subject"}),
+                "image_b": ("IMAGE", {"tooltip": "additional reference image; its vision block follows every image in the primary batch"}),
+                "reference_images": ("IMAGE", {"tooltip": "additional references as an N-image batch. Keep this order identical to Krea2EditModelPatch.reference_images."}),
                 "grounding_px": ("INT", {"default": 768, "min": 0, "max": 4096, "step": 64,
                                           "tooltip": "cap longest side fed to Qwen3-VL; 0 = native"}),
                 "system_prompt": ("STRING", {"multiline": True, "default": "",
@@ -447,14 +492,6 @@ class Krea2EditGroundedEncode:
     CATEGORY = "krea2edit"
     DESCRIPTION = "Encodes an instruction with Qwen3-VL image grounding, then sends only its language-token states to the DiT."
 
-    KREA2_EDIT_TEMPLATE_2REF = (
-        "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
-        "texture, quantity, text, spatial relationships of the objects and background:"
-        "<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-        "<|vision_start|><|image_pad|><|vision_end|>"
-        "{}<|im_end|>\n<|im_start|>assistant\n"
-    )
-
     def _prep(self, image, grounding_px):
         samples = image.movedim(-1, 1)  # B,H,W,C -> B,C,H,W
         h, w = samples.shape[2], samples.shape[3]
@@ -463,17 +500,21 @@ class Krea2EditGroundedEncode:
             samples = comfy.utils.common_upscale(samples, round(w * s), round(h * s), "area", "disabled")
         return samples.movedim(1, -1)[:, :, :, :3]
 
-    def encode(self, clip, prompt, image=None, image_b=None, grounding_px=768, system_prompt="", **_future):
+    def encode(self, clip, prompt, image=None, image_b=None, reference_images=None,
+               grounding_px=768, system_prompt="", **_future):
         if _future:
             print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
                   f"know ({', '.join(sorted(_future))}). Update comfyui-krea2edit and restart "
                   f"ComfyUI. Continuing without them.", flush=True)
-        if image is None:  # text-only fallback = old behavior
+        raw_images = (
+            _split_reference_images(image)
+            + _split_reference_images(image_b)
+            + _split_reference_images(reference_images)
+        )
+        if not raw_images:  # text-only fallback = old behavior
             tokens = clip.tokenize(prompt)
             return (clip.encode_from_tokens_scheduled(tokens),)
-        imgs = [self._prep(image, grounding_px)]
-        if image_b is not None:
-            imgs.append(self._prep(image_b, grounding_px))
+        imgs = [self._prep(ref, grounding_px) for ref in raw_images]
         template = self._template(len(imgs), system_prompt)
         tokens = clip.tokenize(prompt, images=imgs, llama_template=template)
         return (_encode_grounded_text_only(clip, tokens),)
