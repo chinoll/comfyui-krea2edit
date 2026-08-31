@@ -7,6 +7,9 @@ into the Qwen3-VL text encoder (semantic grounding). The VLM's visual-patch hidd
 states are then removed, so only image-grounded language-token states enter the DiT.
 Source latent tokens receive the clean endpoint `t=0` AdaLN modulation, while target
 tokens receive the sampler's current timestep; attention still runs over both blocks.
+Each image has an independent RoPE grid: references keep their native aspect ratio and
+begin at `(h=0, w=0)` in their own frame. The node never crops or resizes a reference;
+it adds only bottom/right edge padding needed for the 16-pixel VAE/DiT lattice.
 
 ☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU compute for future versions.
 
@@ -14,8 +17,9 @@ tokens receive the sampler's current timestep; attention still runs over both bl
 
 ## Model versions
 
-See [CHANGELOG.md](CHANGELOG.md) — **v1.2 is recommended** (better face likeness,
-plus the new `fit` reference geometry and `ref_boost` fidelity dial).
+This native-grid fork requires a LoRA trained with the paired native-grid trainer. It
+is not geometry-compatible with released v1/v1.1/v1.2 Identity Edit LoRAs, which used
+target-fitted or cropped references.
 
 ## Installation
 
@@ -40,16 +44,11 @@ non-causal and the RoPE positions are unchanged. Inputs:
 - `source_latent` — VAEEncode of the image being edited
 - `source_latent_b` *(optional)* — second reference (RoPE frame 2) for two-input
   edits (e.g. person + scene)
-- `vae` + `source_image` *(optional, recommended)* — the blur-proof pixel path: give
-  the raw image (and VAE) and the node fits it to the target grid in pixel space.
-  Required for `fit_mode: fit`.
-- `target_latent` *(optional, recommended whenever you use the pixel path)* — wire the
-  **same** latent you feed `KSampler.latent_image`. It only tells the node the output
-  resolution ahead of time, so the source can be VAE-encoded here instead of on the first
-  sampling step. Skipping it can cost real speed — see [Pixel path and VRAM](#pixel-path-and-vram).
-- `fit_mode` *(default `fit`)* — how a source fits a mismatched output aspect ratio.
-  `fit` = training-matched resample at a centered offset (v1.2); `crop` = center-crop,
-  the v1/v1.1-legacy geometry (use with older weights).
+- `vae` + `source_image` *(optional, recommended)* — VAE-encodes the original source
+  image in pixel space, preserving its native aspect ratio and resolution. It is only
+  edge-padded to the 16-pixel patch lattice; no crop or resize is performed.
+- `target_latent` *(optional, legacy compatibility)* — no longer needed: native-grid
+  source encoding does not depend on output resolution.
 - `ref_boost` *(default 1.0)* — reference-fidelity dial; >1 pulls harder toward the
   reference's appearance, <1 loosens. `ref_boost_a` is the same dial for the scene ref in two-ref edits.
 
@@ -81,7 +80,6 @@ Krea2EditModelPatch ── KSampler.model
 Krea2EditGroundedEncode ── KSampler.positive
 Krea2EditGroundedEncode (empty prompt, same image) ── KSampler.negative
 EmptySD3LatentImage ─┬─ KSampler.latent_image
-                     └─ Krea2EditModelPatch.target_latent   (when using vae + source_image)
 ```
 
 Example workflow in `workflows/`: `krea2_identity_edit.json` — single-image editor by
@@ -89,10 +87,10 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
 
 ## Usage notes (read these — they matter)
 
-1. **Aspect ratio.** With `fit_mode: fit` (default in v1.2) and `vae` + `source_image`
-   connected, mismatched source/output aspect ratios are handled — the source is
-   resampled to the target grid. On `crop`/legacy weights, still match the AR: a
-   mismatched AR is out of distribution and degrades identity/preservation.
+1. **Aspect ratio.** Source and output may use different aspect ratios. Each reference
+   has its own `(frame, h, w)` RoPE grid and is never fitted to the output grid. Larger
+   source images create more reference tokens, so keep their native resolution within
+   your VRAM budget.
 2. **Turbo, 8 steps, CFG 1** is the fast path (~1 min at 2MP) and works for most
    edits: recolor, add/insert, attribute changes, restyles, scene translation.
 3. **Removals and other "delete salient content" edits need real guidance:**
@@ -108,40 +106,22 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
    the main inputs, subject B on the `_b` inputs) rather than adding them one at a time —
    simultaneous placement is currently more reliable than chaining separate edits. Face
    separation is still imperfect and a focus for future versions.
-8. **Wire `target_latent` if you use `vae` + `source_image`** — see below.
 
 ## Pixel path and VRAM
 
-The pixel path has to VAE-encode the source at the output resolution. Without
-`target_latent` the node doesn't know that resolution until sampling starts, so the
-encode runs on the first step — and `vae.encode` asks ComfyUI for VRAM at a moment when
-the diffusion model is already resident and mid-run. ComfyUI frees room by partially
-offloading whatever is loaded, the sampler included, and nothing loads it back (it loads
-once, before its loop). The rest of the run then streams weights from CPU on every step.
-
-Wiring `target_latent` moves the encode to node-execution time, restoring the normal
-`VAEEncode → KSampler` order where the sampler evicts the VAE rather than the reverse.
-The encode is cached either way, so this is purely about *when* it happens.
-
-If you have VRAM headroom for the model and the VAE at once, nothing gets offloaded and
-neither wiring costs you anything — which is why this only bites some setups. Wire it
-anyway; it's free.
+The pixel path VAE-encodes each source once at node-execution time, before sampling,
+on that source's native pixel grid. It needs no target resolution and therefore no
+longer needs `target_latent`. The source is padded only on its bottom/right edge to a
+multiple of 16 pixels; it is not cropped or resampled.
 
 The console tells you which path you got:
 
 ```
-[krea2edit] pre-encoding sources at target 128x128 (before sampling, fit_mode=fit)   <- good
-[krea2edit] NOTE: connect 'target_latent' ...                                        <- encode will land mid-sampling
+[krea2edit] native source VAE encode: (513, 777) -> (528, 784) px (edge padding only)
 ```
 
-**Measure over 20+ steps, not 1.** The source still has to be VAE-encoded either way —
-`target_latent` only changes *when*. What it removes is a per-step penalty, so it can
-only show up across many steps. A 1-step run is almost entirely fixed overhead (model
-load, text encode, VAE encode/decode) and will show no difference at all.
-
-A third option is to skip the pixel path entirely: resize your source image to exactly
-the output resolution and feed only `source_latent`. At matched resolution the latent
-path does no resampling and produces the same reference geometry.
+You may instead supply `source_latent` directly. Its native latent grid is used as-is,
+apart from DiT patch alignment padding.
 
 ## License / credits
 

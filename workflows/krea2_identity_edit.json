@@ -474,8 +474,7 @@
       },
       "widgets_values": [
         4,
-        1,
-        "fit"
+        1
       ]
     },
     {
@@ -889,7 +888,7 @@
         "Node name for S&R": "Note"
       },
       "widgets_values": [
-        "THE FIDELITY DIAL (ref_boost) - how hard the model looks at your\nreference. New in this release.\n\n  1.0 = classic v1.1 behavior\n  4.0 = recommended (pre-set): much stronger face + body likeness,\n        more reliable edits\n  >10 = over-copy: removals/replacements start failing\n  <1  = suppress the reference (creative freedom)\n\nref_boost_a: the scene dial (image 1) in two-image mode -\nleave at 1.0 unless you are exploring. ref_boost applies to the\nperson (image 2) when group 2 is enabled, else to your image.\n\nfit_mode: how inputs fit a different output aspect\nratio. fit = resample to the output shape (default, recommended); crop (legacy) = center-crop\nonly for v1/v1.1 weights."
+        "THE FIDELITY DIAL (ref_boost) - how hard the model looks at your\nreference.\n\n  1.0 = neutral\n  4.0 = stronger face + body likeness\n  >10 = over-copy: removals/replacements start failing\n  <1  = suppress the reference (creative freedom)\n\nref_boost_a: the scene dial (image 1) in two-image mode -\nleave at 1.0 unless you are exploring. ref_boost applies to the\nperson (image 2) when group 2 is enabled, else to your image.\n\nNative-grid geometry: every image has its own RoPE grid. Source images\nare not cropped or resized to the output; only edge padding is added\nfor patch alignment. Use a LoRA trained with this native-grid trainer."
       ],
       "color": "#432",
       "bgcolor": "#653"

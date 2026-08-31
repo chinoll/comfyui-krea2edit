@@ -7,9 +7,9 @@ wrapper, that victim was the diffusion model the sampler was in the middle of us
 nothing re-expands it (`sampler_helpers` loads once, before the loop). The rest of the run
 then streamed weights from CPU on every step.
 
-`target_latent` moves the encode to node-execution time, before the sampler loads
-anything. These tests pin the observable behavior: WHEN the encode happens, and that it
-still happens exactly once either way.
+Native-grid sources are encoded at node-execution time, before the sampler loads
+anything, because their encoding no longer depends on the target resolution. These
+tests pin that timing and the no-crop, edge-padding-only geometry.
 
 Self-contained: installs a minimal ComfyUI stub when the real one is not importable, so
 it runs both inside a ComfyUI checkout and standalone.
@@ -132,8 +132,8 @@ def _latent(h=64, w=64):
     return {"samples": torch.zeros(1, 4, h, w)}
 
 
-def _image(px=512):
-    return torch.zeros(1, px, px, 3)
+def _image(h=512, w=None):
+    return torch.zeros(1, h, h if w is None else w, 3)
 
 
 def _patch(mod, **kwargs):
@@ -160,9 +160,8 @@ def _stub_forward(mod, seen):
     mod.krea2_edit_forward = lambda dm, x, t, ctx, src, to, **k: seen.append(src)
 
 
-def test_target_latent_encodes_before_sampling():
-    """The whole point: with target_latent wired, the encode is done by the time patch()
-    returns — i.e. before the sampler loads the diffusion model."""
+def test_pixel_source_encodes_before_sampling():
+    """Native-grid source encoding completes during patch(), before sampling begins."""
     mod = _load_pack()
     seen = []
     _stub_forward(mod, seen)
@@ -176,18 +175,17 @@ def test_target_latent_encodes_before_sampling():
     assert seen[0].shape == (1, 4, 64, 64)
 
 
-def test_without_target_latent_encode_lands_in_the_wrapper():
-    """Legacy path stays functional (and stays the slow one) — documents the contrast."""
+def test_target_latent_is_not_needed_for_preencode():
     mod = _load_pack()
     seen = []
     _stub_forward(mod, seen)
     vae = _FakeVAE()
     wrapper = _patch(mod, vae=vae, source_image=_image())
 
-    assert vae.calls == [], "nothing to encode yet without a known target resolution"
+    assert len(vae.calls) == 1, "native-grid source must encode without target_latent"
 
     _run_steps(wrapper)
-    assert len(vae.calls) == 1, "encode happens on the first step, then caches"
+    assert len(vae.calls) == 1, "sampling must reuse the native-grid source"
 
 
 def test_both_references_are_pre_encoded():
@@ -205,20 +203,31 @@ def test_both_references_are_pre_encoded():
     assert isinstance(seen[0], list) and len(seen[0]) == 2
 
 
-def test_mismatched_target_latent_falls_back_correctly():
-    """A target_latent that doesn't match what's actually sampled must not corrupt the
-    source — the cache simply misses and the wrapper re-encodes at the real size."""
+def test_target_latent_does_not_change_native_source_geometry():
     mod = _load_pack()
     seen = []
     _stub_forward(mod, seen)
     vae = _FakeVAE()
     wrapper = _patch(mod, vae=vae, source_image=_image(), target_latent=_latent(32, 32))
 
-    assert len(vae.calls) == 1                    # primed at the wrong size
+    assert len(vae.calls) == 1
 
     _run_steps(wrapper, n=2, h=64, w=64)
-    assert len(vae.calls) == 2, "one re-encode at the real target size, then cached"
-    assert seen[0].shape == (1, 4, 64, 64), "source must match the sampled grid"
+    assert len(vae.calls) == 1, "target resolution must not trigger a re-encode"
+    assert seen[0].shape == (1, 4, 64, 64)
+
+
+def test_pixel_source_keeps_its_native_grid_with_only_edge_padding():
+    mod = _load_pack()
+    seen = []
+    _stub_forward(mod, seen)
+    vae = _FakeVAE()
+    wrapper = _patch(mod, vae=vae, source_image=_image(513, 777), target_latent=_latent(32, 32))
+
+    # 513x777 is padded (not cropped/resized) to the next 16-pixel lattice.
+    assert vae.calls == [(1, 528, 784, 3)]
+    _run_steps(wrapper)
+    assert seen[0].shape == (1, 4, 66, 98)
 
 
 def test_target_latent_without_pixel_path_is_inert():
