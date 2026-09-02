@@ -82,7 +82,9 @@ def _remove_visual_tokens_from_conditioning(conditioning, visual_masks):
                 "a single text-only DiT conditioning tensor."
             )
 
-        keep = ~visual_mask[0]
+        # Qwen3-VL builds the mask on CPU while the conditioning may be on the
+        # compute device; move the index to cond's device before fancy indexing.
+        keep = (~visual_mask[0]).to(cond.device)
         next_options = dict(options)
         attention_mask = next_options.get("attention_mask")
         if attention_mask is not None:
