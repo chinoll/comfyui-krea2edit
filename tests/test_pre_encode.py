@@ -22,6 +22,7 @@ import os
 import sys
 import types
 
+import pytest
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -252,6 +253,24 @@ def test_direct_latent_source_resizes_to_nearest_dit_patch_grid():
     assert seen[0].shape == (1, 4, 66, 98)
 
 
+def test_native_5d_source_latent_is_accepted():
+    """Krea2's native VAE emits (N,C,1,H,W); the node must accept that layout."""
+    mod = _load_pack()
+    seen = []
+    _stub_forward(mod, seen)
+    wrapper = _patch(mod, source_latent={"samples": torch.zeros(1, 4, 1, 65, 97)})
+
+    _run_steps(wrapper)
+    # Native 5D layout passes through to forward untouched; _to_4d handles it there.
+    assert seen[0].shape == (1, 4, 1, 66, 98)
+
+
+def test_native_5d_video_latent_is_rejected():
+    mod = _load_pack()
+    with pytest.raises(ValueError, match="video latent"):
+        _patch(mod, source_latent={"samples": torch.zeros(1, 4, 3, 64, 64)})
+
+
 def test_target_latent_does_not_change_patch_aligned_source_geometry():
     mod = _load_pack()
     seen = []
@@ -305,6 +324,29 @@ def test_arbitrary_size_canvas_resizes_to_nearest_patch_grid():
     assert image.shape == (1, 784, 512, 3)
 
 
+def test_native_5d_canvas_decodes_to_image_layout():
+    """Native Krea2 latents are (N,C,1,H,W); the VAE returns (N,1,H,W,C) and the
+    node must hand back an (N,H,W,C) IMAGE."""
+    mod = _load_pack()
+
+    class _NativeVAE:
+        def decode(self, samples):
+            b, _c, t, h, w = samples.shape
+            return torch.zeros(b, t, h * 8, w * 8, 3)
+
+    latent = {"samples": torch.zeros(1, 16, 1, 1024 // 8, 1024 // 8)}
+    (image,) = mod.Krea2EditVAEDecode().decode(_NativeVAE(), latent, 1024, 1024)
+    assert image.shape == (1, 1024, 1024, 3)
+
+
+def test_native_5d_video_latent_decode_is_rejected():
+    mod = _load_pack()
+    vae = _FakeVAE()
+    latent = {"samples": torch.zeros(1, 16, 3, 64, 64)}
+    with pytest.raises(ValueError, match="single images"):
+        mod.Krea2EditVAEDecode().decode(vae, latent, 512, 512)
+
+
 def test_grounded_encode_keeps_image_grounded_text_but_removes_visual_positions():
     """The VLM must run on image positions, but the returned DiT context must not
     retain those positions (or their matching attention-mask entries)."""
@@ -323,9 +365,21 @@ def test_grounded_encode_keeps_image_grounded_text_but_removes_visual_positions(
     class _FakeClip:
         def __init__(self):
             self.vlm = _FakeVLM()
-            self.cond_stage_model = type("Stage", (), {
-                "transformer": type("ClipModel", (), {"transformer": self.vlm})()
-            })()
+
+            # Mirror Krea2TEModel (SD1ClipModel): the Qwen3VLClipModel is stored
+            # under a ``clip_<name>`` attribute; its ``transformer`` is the VLM.
+            class _ClipModel:
+                def __init__(self, vlm):
+                    self.transformer = vlm
+
+            class _Stage:
+                def __init__(self, vlm):
+                    self.clip_qwen3vl_4b = _ClipModel(vlm)
+
+                def modules(self):
+                    return [self, self.clip_qwen3vl_4b]
+
+            self.cond_stage_model = _Stage(self.vlm)
 
         def encode_from_tokens_scheduled(self, _tokens):
             self.vlm.build_image_inputs(None, [])
