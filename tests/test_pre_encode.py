@@ -323,9 +323,21 @@ def test_grounded_encode_keeps_image_grounded_text_but_removes_visual_positions(
     class _FakeClip:
         def __init__(self):
             self.vlm = _FakeVLM()
-            self.cond_stage_model = type("Stage", (), {
-                "transformer": type("ClipModel", (), {"transformer": self.vlm})()
-            })()
+
+            # Mirror Krea2TEModel (SD1ClipModel): the Qwen3VLClipModel is stored
+            # under a ``clip_<name>`` attribute; its ``transformer`` is the VLM.
+            class _ClipModel:
+                def __init__(self, vlm):
+                    self.transformer = vlm
+
+            class _Stage:
+                def __init__(self, vlm):
+                    self.clip_qwen3vl_4b = _ClipModel(vlm)
+
+                def modules(self):
+                    return [self, self.clip_qwen3vl_4b]
+
+            self.cond_stage_model = _Stage(self.vlm)
 
         def encode_from_tokens_scheduled(self, _tokens):
             self.vlm.build_image_inputs(None, [])

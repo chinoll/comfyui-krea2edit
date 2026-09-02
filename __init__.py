@@ -95,20 +95,35 @@ def _remove_visual_tokens_from_conditioning(conditioning, visual_masks):
     return filtered
 
 
+def _find_vlm_module(clip):
+    """Locate the Qwen3-VL module that owns build_image_inputs.
+
+    Krea2TEModel (an SD1ClipModel) stores its Qwen3VLClipModel under an attribute
+    named ``clip_<name>`` (e.g. ``clip_qwen3vl_4b``); the clip model in turn holds
+    the Qwen3-VL language module as ``transformer``. Scan the CLIP module tree so
+    the lookup does not depend on the exact attribute name.
+    """
+    stage = clip.cond_stage_model
+    for module in list(stage.modules()):
+        for candidate in (module, getattr(module, "transformer", None)):
+            if candidate is not None and callable(getattr(candidate, "build_image_inputs", None)):
+                return candidate
+    return None
+
+
 def _encode_grounded_text_only(clip, tokens):
     """Encode through Qwen3-VL, then remove its visual states from DiT context.
 
     The hook is around the *real* ComfyUI encode call (not a second preprocessing
     pass), so it captures the exact dynamic visual span produced by the VLM.
     """
-    try:
-        vlm = clip.cond_stage_model.transformer.transformer
-        original_build_image_inputs = vlm.build_image_inputs
-    except AttributeError as exc:
+    vlm = _find_vlm_module(clip)
+    if vlm is None:
         raise RuntimeError(
             "krea2edit: this node requires ComfyUI's native Qwen3-VL/Krea2 text encoder "
             "with build_image_inputs support."
-        ) from exc
+        )
+    original_build_image_inputs = vlm.build_image_inputs
 
     visual_masks = []
 
