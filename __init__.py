@@ -185,7 +185,15 @@ def _resize_to_patch_grid(image, patch=16):
 
 
 def _resize_latent_to_patch_grid(latent, patch=2):
-    """Resize BCHW latents to the nearest DiT patch grid for direct-LATENT inputs."""
+    """Resize latent H/W to the nearest DiT patch grid for direct-LATENT inputs.
+
+    Accepts both the 4D (N,C,H,W) and Krea2's native 5D (N,C,T,H,W) layout;
+    the 5D layout is resized per frame and returned unchanged in rank.
+    """
+    if latent.ndim == 5:
+        b, c, t, h, w = latent.shape
+        out = _resize_latent_to_patch_grid(latent.reshape(b * t, c, h, w), patch)
+        return out.reshape(b, c, t, out.shape[2], out.shape[3])
     h, w = latent.shape[-2:]
     aligned_h, aligned_w = _nearest_patch_size(h, patch), _nearest_patch_size(w, patch)
     if (aligned_h, aligned_w) == (h, w):
@@ -199,21 +207,39 @@ def _split_reference_images(images):
         return []
     if isinstance(images, (list, tuple)):
         return [ref for group in images for ref in _split_reference_images(group)]
-    if not torch.is_tensor(images) or images.ndim != 4:
+    if not torch.is_tensor(images):
         raise ValueError(
             "krea2edit: reference_images must be an IMAGE batch shaped (N,H,W,C)"
+        )
+    if images.ndim != 4:
+        raise ValueError(
+            "krea2edit: reference_images must be an IMAGE batch shaped (N,H,W,C), "
+            f"got samples shaped {tuple(images.shape)}"
         )
     return [images[i:i + 1] for i in range(images.shape[0])]
 
 
 def _split_reference_latents(latent):
-    """Normalize a LATENT batch into B=1 reference latents."""
+    """Normalize a LATENT batch into B=1 reference latents.
+
+    Accepts 4D (N,C,H,W) and Krea2's native VAE layout 5D (N,C,T,H,W) with T=1;
+    the layout is passed through as-is (the native DiT consumes both ranks).
+    """
     if latent is None:
         return []
     samples = latent["samples"]
-    if samples.ndim != 4:
+    if samples.ndim == 5:
+        if samples.shape[2] != 1:
+            raise ValueError(
+                "krea2edit: reference_latents got a video latent with "
+                f"T={samples.shape[2]} ({tuple(samples.shape)}); this node handles "
+                "single images (T=1) only. Use the image inputs with vae connected."
+            )
+    elif samples.ndim != 4:
         raise ValueError(
-            "krea2edit: reference_latents must contain samples shaped (N,C,H,W)"
+            "krea2edit: reference_latents must contain samples shaped (N,C,H,W) or "
+            "native Krea2 (N,C,1,H,W), got samples shaped "
+            f"{tuple(samples.shape)}"
         )
     return [samples[i:i + 1] for i in range(samples.shape[0])]
 
@@ -617,7 +643,17 @@ class Krea2EditVAEDecode:
     DESCRIPTION = "Decodes a Krea2Edit latent at the nearest 16px-aligned output size."
 
     def decode(self, vae, latent, width, height):
-        pixels = vae.decode(latent["samples"])
+        samples = latent["samples"]
+        if samples.ndim == 5 and samples.shape[2] != 1:
+            raise ValueError(
+                "krea2edit: Krea2EditVAEDecode decodes single images; got a latent "
+                f"with T={samples.shape[2]} ({tuple(samples.shape)})"
+            )
+        pixels = vae.decode(samples)
+        # Native Krea2 latents are (N,C,1,H,W); the VAE decodes them frame-wise
+        # into (N,1,H,W,C) pixels, which is not the IMAGE layout.
+        if pixels.ndim == 5 and pixels.shape[1] == 1:
+            pixels = pixels[:, 0]
         aligned_h, aligned_w = _nearest_patch_size(height), _nearest_patch_size(width)
         if (pixels.shape[1], pixels.shape[2]) != (aligned_h, aligned_w):
             pixels = F.interpolate(
